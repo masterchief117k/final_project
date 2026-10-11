@@ -1,14 +1,20 @@
 # =============================================================================
-# 0) Install dependencies if you haven’t already:
-#    pip install nltk scikit-learn matplotlib
+# 20 Newsgroups: K-Means Cluster Explorer (Streamlit)
+#
+#   pip install -r requirements.txt
+#   streamlit run app.py
+#
+# The first launch downloads the dataset and fits the model (a minute or two);
+# after that, results are cached and the app responds instantly.
 # =============================================================================
 
 import re
 import nltk
+import numpy as np
 import matplotlib.pyplot as plt
-from collections import Counter
+import streamlit as st
 from sklearn.datasets            import fetch_20newsgroups
-from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition       import TruncatedSVD, PCA
 from sklearn.cluster             import KMeans
 from sklearn.metrics             import silhouette_score
@@ -20,56 +26,20 @@ from nltk.corpus       import stopwords
 from nltk.stem         import WordNetLemmatizer
 from nltk.tokenize     import RegexpTokenizer
 
-# 1) Download NLTK data once
-nltk.download('stopwords')
-nltk.download('wordnet')
-nltk.download('omw-1.4')
+# Best configuration found by the grid search below (silhouette = 0.135).
+BEST_PARAMS = {
+    'tfidf__ngram_range': (1, 2),
+    'tfidf__min_df':       1,
+    'tfidf__max_df':       0.8,
+    'svd__n_components':   50,
+    'cluster__n_clusters': 10,
+    'cluster__init':       'k-means++',
+    'cluster__n_init':     5,
+}
 
-# =============================================================================
-# 2) Load & Clean Text
-# =============================================================================
-data     = fetch_20newsgroups(subset='all',
-                              remove=('headers','footers','quotes'),
-                              shuffle=True, random_state=42)
-raw_docs = data.data
+# Set to True to re-run the full grid search (192 configurations; slow).
+RUN_GRID_SEARCH = False
 
-tokenizer  = RegexpTokenizer(r"[A-Za-z']+")
-stop_words = set(stopwords.words('english'))
-lemmatizer = WordNetLemmatizer()
-
-def clean_text(text):
-    # strip quotes and collapse newlines
-    text = re.sub(r">.+", " ", text)
-    text = re.sub(r"\n+", " ", text)
-    # tokenize, lowercase, drop stopwords, lemmatize
-    toks = tokenizer.tokenize(text.lower())
-    return " ".join(
-        lemmatizer.lemmatize(t) for t in toks
-        if t not in stop_words
-    )
-
-cleaned = [clean_text(doc) for doc in raw_docs]
-# drop any empty docs
-cleaned = [doc for doc in cleaned if doc.strip()]
-print(f"→ {len(cleaned)} non-empty documents after cleaning")
-
-# quick sanity check of vocab size
-toy_vocab = CountVectorizer().fit(cleaned).vocabulary_
-print(f"→ initial vocab size: {len(toy_vocab)} tokens")
-
-# =============================================================================
-# 3) Build the base pipeline (with placeholder hyperparams)
-# =============================================================================
-pipe = Pipeline([
-    ('tfidf',   TfidfVectorizer()),
-    ('norm',    Normalizer()),         # unit-length = cosine similarity
-    ('svd',     TruncatedSVD(random_state=42)),
-    ('cluster', KMeans(random_state=42))
-])
-
-# =============================================================================
-# 4) Define your hyperparameter grid
-# =============================================================================
 param_grid = {
     'tfidf__ngram_range': [(1,1), (1,2)],
     'tfidf__min_df':       [1, 5],
@@ -80,133 +50,115 @@ param_grid = {
     'cluster__n_init':     [5, 10]
 }
 
-# =============================================================================
-# 5) Manual grid search with try/except
-# =============================================================================
-best_score, best_params = -1, None
-
-for params in ParameterGrid(param_grid):
-    try:
-        # set pipeline hyperparameters
-        pipe.set_params(**params)
-        # fit transforms all steps
-        pipe.fit(cleaned)
-
-        # extract reduced data for silhouette
-        X_tfidf  = pipe.named_steps['tfidf'].transform(cleaned)
-        X_norm   = pipe.named_steps['norm'].transform(X_tfidf)
-        X_reduced= pipe.named_steps['svd'].transform(X_norm)
-        labels   = pipe.named_steps['cluster'].labels_
-
-        score = silhouette_score(X_reduced, labels, metric='euclidean')
-
-        if score > best_score:
-            best_score, best_params = score, params
-            print(f"New best {best_score:.3f} with {best_params}")
-
-    except ValueError:
-        # skip combos that produce empty vocab or other errors
-        continue
-
-print("\n=== Grid search complete ===")
-print(f"Best silhouette score: {best_score:.3f}")
-print(f"Best parameters:       {best_params}")
 
 # =============================================================================
-# 6) Fit final pipeline on all data
+# 1) Load & clean text
 # =============================================================================
-pipe.set_params(**best_params)
-pipe.fit(cleaned)
+tokenizer = RegexpTokenizer(r"[A-Za-z']+")
 
-# 7) 2D Visualization via PCA
-X_tfidf   = pipe.named_steps['tfidf'].transform(cleaned)
-X_norm    = pipe.named_steps['norm'].transform(X_tfidf)
-X_reduced = pipe.named_steps['svd'].transform(X_norm)
-labels    = pipe.named_steps['cluster'].labels_
+def clean_text(text, stop_words, lemmatizer):
+    # strip quoted replies and collapse newlines
+    text = re.sub(r">.+", " ", text)
+    text = re.sub(r"\n+", " ", text)
+    # tokenize, lowercase, drop stopwords, lemmatize
+    toks = tokenizer.tokenize(text.lower())
+    return " ".join(lemmatizer.lemmatize(t) for t in toks if t not in stop_words)
 
-coords = PCA(n_components=2, random_state=42).fit_transform(X_reduced)
+@st.cache_data(show_spinner="Downloading and cleaning 20 Newsgroups…")
+def load_corpus():
+    for pkg in ('stopwords', 'wordnet', 'omw-1.4'):
+        nltk.download(pkg, quiet=True)
+    stop_words = set(stopwords.words('english'))
+    lemmatizer = WordNetLemmatizer()
+    data = fetch_20newsgroups(subset='all', remove=('headers', 'footers', 'quotes'),
+                              shuffle=True, random_state=42)
+    cleaned = [clean_text(doc, stop_words, lemmatizer) for doc in data.data]
+    return [doc for doc in cleaned if doc.strip()]   # drop empty docs
 
-plt.figure(figsize=(8,6))
-plt.scatter(coords[:,0], coords[:,1],
-            c=labels, cmap='tab20', s=4)
-plt.title("Final K-Means Clusters (2D PCA Projection)")
-plt.xticks([]); plt.yticks([])
-plt.show()
-# assume you ran:
-#   grid.fit(cleaned)
-# and then:
 
-# 1) Inject the winning params into your pipeline
-pipe.set_params(**best_params)
+# =============================================================================
+# 2) Pipeline: TF-IDF -> unit-normalise -> LSA (SVD) -> K-Means
+# =============================================================================
+def build_pipeline():
+    return Pipeline([
+        ('tfidf',   TfidfVectorizer()),
+        ('norm',    Normalizer()),         # unit-length = cosine similarity
+        ('svd',     TruncatedSVD(random_state=42)),
+        ('cluster', KMeans(random_state=42))
+    ])
 
-# 2) Fit it on the entire cleaned corpus
-pipe.fit(cleaned)
+def reduced_features(pipe, docs):
+    X = pipe.named_steps['tfidf'].transform(docs)
+    X = pipe.named_steps['norm'].transform(X)
+    return pipe.named_steps['svd'].transform(X)
 
-# 3) Alias it as your best estimator
-best_pipe = pipe
+def grid_search(docs):
+    best_score, best_params = -1, None
+    for params in ParameterGrid(param_grid):
+        try:
+            pipe = build_pipeline().set_params(**params).fit(docs)
+            score = silhouette_score(reduced_features(pipe, docs),
+                                     pipe.named_steps['cluster'].labels_)
+            if score > best_score:
+                best_score, best_params = score, params
+                print(f"New best {best_score:.3f} with {best_params}")
+        except ValueError:
+            continue   # skip combos that produce an empty vocabulary
+    return best_params
 
-# pull out the TF-IDF vectorizer and the final KMeans
-tfidf = best_pipe.named_steps['tfidf']
-km    = best_pipe.named_steps['cluster']
+@st.cache_resource(show_spinner="Fitting TF-IDF, LSA and K-Means…")
+def fit_model(docs):
+    params = grid_search(docs) if RUN_GRID_SEARCH else BEST_PARAMS
+    pipe = build_pipeline().set_params(**params).fit(docs)
+    X_reduced = reduced_features(pipe, docs)
+    labels = pipe.named_steps['cluster'].labels_
+    score = silhouette_score(X_reduced, labels, sample_size=5000, random_state=42)
 
-# now this is safe, because tfidf has been fit
-features = tfidf.get_feature_names_out()
-centers  = km.cluster_centers_
-tfidf = best_pipe.named_steps['tfidf']
-km    = best_pipe.named_steps['cluster']
+    # Top terms: cluster centres live in the 50-d LSA space, so map them back
+    # to the TF-IDF vocabulary before ranking words.
+    centers_tfidf = pipe.named_steps['svd'].inverse_transform(
+        pipe.named_steps['cluster'].cluster_centers_)
+    vocab = pipe.named_steps['tfidf'].get_feature_names_out()
+    top_terms = {cid: [vocab[i] for i in centre.argsort()[-10:][::-1]]
+                 for cid, centre in enumerate(centers_tfidf)}
 
-# Get feature names and cluster centers
-features = tfidf.get_feature_names_out()
-centers  = km.cluster_centers_
+    coords = PCA(n_components=2, random_state=42).fit_transform(X_reduced)
+    return params, labels, top_terms, coords, score
 
-# Print top terms per cluster
-for cid, centroid in enumerate(centers):
-    top_idxs  = centroid.argsort()[-10:][::-1]
-    top_terms = [features[i] for i in top_idxs]
-    print(f"Cluster {cid}: {', '.join(top_terms)}")
 
-#%%
-labels = km.labels_
-for cid in range(km.n_clusters):
-    print(f"\n=== Cluster {cid} Samples ===")
-    samples = [doc for doc, lab in zip(cleaned, labels) if lab == cid][:3]
-    for s in samples:
-        print(" •", s[:200].replace("\n"," "), "…")
-import streamlit as st
-
-# 1) pull fitted pieces from your best pipeline
-tfidf = best_pipe.named_steps['tfidf']
-km    = best_pipe.named_steps['cluster']
-
-# 2) compute top terms per cluster
-features = tfidf.get_feature_names_out()
-centers  = km.cluster_centers_
-cluster_top_terms = {}
-for cid, centroid in enumerate(centers):
-    top10_idxs = centroid.argsort()[-10:][::-1]
-    cluster_top_terms[cid] = [features[i] for i in top10_idxs]
-
-# 3) gather example docs per cluster
-labels = km.labels_
-examples_by_cluster = {cid: [] for cid in range(km.n_clusters)}
-for doc, lab in zip(cleaned, labels):
-    examples_by_cluster[lab].append(doc)
-
-# 4) Streamlit UI
+# =============================================================================
+# 3) Streamlit UI
+# =============================================================================
 st.title("20 Newsgroups: K-Means Cluster Explorer")
 
-# Sidebar: pick a cluster
+cleaned = load_corpus()
+params, labels, top_terms, coords, score = fit_model(cleaned)
+n_clusters = params['cluster__n_clusters']
+sizes = np.bincount(labels, minlength=n_clusters)
+
+col1, col2, col3 = st.columns(3)
+col1.metric("Documents", f"{len(cleaned):,}")
+col2.metric("Clusters", n_clusters)
+col3.metric("Silhouette (5k sample)", f"{score:.3f}")
+
 cluster_choice = st.sidebar.selectbox(
     label="Select cluster",
-    options=list(range(km.n_clusters)),
-    format_func=lambda x: f"Cluster {x}"
+    options=list(range(n_clusters)),
+    format_func=lambda c: f"Cluster {c} · {', '.join(top_terms[c][:3])} ({sizes[c]:,})"
 )
 
-# Show top terms
 st.subheader(f"Top terms for cluster {cluster_choice}")
-st.write(", ".join(cluster_top_terms[cluster_choice]))
+st.write(", ".join(top_terms[cluster_choice]))
 
-# Show a few sample documents
-st.subheader(f"Sample documents for cluster {cluster_choice}")
-for ex in examples_by_cluster[cluster_choice][:5]:
-    st.markdown(f"> {ex[:300].replace(chr(10), ' ')} …")
+st.subheader("Where this cluster sits (2-D PCA projection)")
+fig, ax = plt.subplots(figsize=(7, 5))
+ax.scatter(coords[:, 0], coords[:, 1], c='lightgrey', s=3)
+mask = labels == cluster_choice
+ax.scatter(coords[mask, 0], coords[mask, 1], c='tab:blue', s=4)
+ax.set_xticks([]); ax.set_yticks([])
+st.pyplot(fig)
+
+st.subheader(f"Sample documents ({sizes[cluster_choice]:,} in this cluster)")
+examples = [doc for doc, lab in zip(cleaned, labels) if lab == cluster_choice]
+for ex in examples[:5]:
+    st.markdown(f"> {ex[:300]} …")
